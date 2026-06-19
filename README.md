@@ -6,7 +6,13 @@ Read more about SOTAWHAT [here](https://huyenchip.com/2018/10/04/sotawhat.html).
 
 You can use sotawhat through a web interface [here](https://sotawhat.herokuapp.com/#/). Thanks hmchuong!
 
-This script runs using Python 3. It requires ``nltk``, ``six``, and ``pyspellchecker``. To install it as a Python package, follow the following steps:
+This fork queries the official [arXiv API](https://info.arxiv.org/help/api/index.html)
+(public, no registration or API key required) and parses the returned Atom XML,
+instead of scraping arXiv's search HTML. This makes it far more resilient to
+website layout changes. SSL certificates are configured automatically via
+``certifi``, so the macOS certificate error below no longer requires manual setup.
+
+This script runs using Python 3. It requires ``nltk``, ``pyspellchecker``, and ``certifi``. To install it as a Python package, follow the following steps:
 
 
 Step 1: clone this repo, and go inside that repo:

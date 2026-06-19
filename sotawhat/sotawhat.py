@@ -3,9 +3,13 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import warnings
+import xml.etree.ElementTree as ET
+from datetime import datetime
 
 import nltk
 from nltk.tokenize import word_tokenize
@@ -27,97 +31,13 @@ try:
 except LookupError:
     nltk.download('punkt')
 
-AUTHOR_TAG = '<a href="/search/?searchtype=author'
-TITLE_TAG = '<p class="title is-5 mathjax">'
-ABSTRACT_TAG = '<span class="abstract-full has-text-grey-dark mathjax"'
-DATE_TAG = '<p class="is-size-7"><span class="has-text-black-bis has-text-weight-semibold">Submitted</span>'
-
-
-def get_authors(lines, i):
-    authors = []
-    while True:
-        if not lines[i].startswith(AUTHOR_TAG):
-            break
-        idx = lines[i].find('>')
-        if lines[i].endswith(','):
-            authors.append(lines[i][idx + 1: -5])
-        else:
-            authors.append(lines[i][idx + 1: -4])
-        i += 1
-    return authors, i
-
-
-def get_next_result(lines, start):
-    """
-    Extract paper from the xml file obtained from arxiv search.
-
-    Each paper is a dict that contains:
-    + 'title': str
-    + 'pdf_link': str
-    + 'main_page': str
-    + 'authors': []
-    + 'abstract': str
-    """
-
-    result = {}
-    # Find the abstract page link (.../abs/<id>) and pdf link (.../pdf/<id>)
-    # within the first few lines of this result block. arXiv's markup shifts
-    # over time, so match by URL pattern rather than fixed line offsets.
-    main_page = ''
-    pdf = ''
-    for line in lines[start:start + 8]:
-        if not main_page:
-            m = re.search(r'href="(https?://arxiv\.org/abs/[^"]+)"', line)
-            if m:
-                main_page = m.group(1)
-        if not pdf:
-            m = re.search(r'href="(https?://arxiv\.org/pdf/[^"]+)"', line)
-            if m:
-                pdf = m.group(1)
-        if main_page and pdf:
-            break
-    result['main_page'] = main_page
-    result['pdf'] = pdf if pdf.endswith('.pdf') else pdf + '.pdf'
-
-    start += 4
-
-    while lines[start].strip() != TITLE_TAG:
-        start += 1
-
-    title = lines[start + 1].strip()
-    title = title.replace('<span class="search-hit mathjax">', '')
-    title = title.replace('</span>', '')
-    result['title'] = title
-
-    authors, start = get_authors(lines, start + 5)  # orig: add 8
-
-    while not lines[start].strip().startswith(ABSTRACT_TAG):
-        start += 1
-    abstract = lines[start + 1]
-    abstract = abstract.replace('<span class="search-hit mathjax">', '')
-    abstract = abstract.replace('</span>', '')
-    result['abstract'] = abstract
-
-    result['authors'] = authors
-
-    while not lines[start].strip().startswith(DATE_TAG):
-        start += 1
-
-    idx = lines[start].find('</span> ')
-    end = lines[start][idx:].find(';')
-
-    result['date'] = lines[start][idx + 8: idx + end]
-
-    return result, start
-
-
-def clean_empty_lines(lines):
-    cleaned = []
-    for line in lines:
-        line = line.strip()
-        if line:
-            cleaned.append(line)
-    return cleaned
+# arXiv's official, public, no-registration API. Returns Atom XML.
+# Docs + terms of use: https://info.arxiv.org/help/api/index.html
+API_URL = 'http://export.arxiv.org/api/query'
+ATOM_NS = '{http://www.w3.org/2005/Atom}'
+PAGE_SIZE = 100        # entries to request per API call
+MAX_PAGES = 10         # safety cap so we never loop forever
+REQUEST_DELAY = 3.0    # seconds between calls (arXiv asks for >= 3s)
 
 
 def is_float(token):
@@ -217,85 +137,143 @@ def get_report(paper, keyword):
     return '', False
 
 
-def txt2reports(txt, keyword, num_to_show):
-    found = False
-    if isinstance(txt, (bytes, bytearray)):
-        txt = txt.decode('utf-8', errors='replace')
-    lines = txt.split('\n')
-    lines = clean_empty_lines(lines)
-    unshown = []
+def format_date(published):
+    """Convert an Atom timestamp (2026-06-18T17:59:05Z) to '18 June, 2026'."""
+    try:
+        dt = datetime.strptime(published[:10], '%Y-%m-%d')
+        return dt.strftime('%-d %B, %Y')
+    except (ValueError, TypeError):
+        return published
 
-    for i in range(len(lines)):
-        if num_to_show <= 0:
-            return unshown, num_to_show, found
 
-        line = lines[i].strip()
-        if len(line) == 0:
-            continue
-        if line == '<li class="arxiv-result">':
-            found = True
-            paper, i = get_next_result(lines, i)
-            report, has_number = get_report(paper, keyword)
+def parse_entry(entry):
+    """Turn one Atom <entry> element into a paper dict."""
+    def text(tag):
+        node = entry.find(ATOM_NS + tag)
+        return node.text.strip() if node is not None and node.text else ''
 
-            if has_number:
-                print(report)
-                print('====================================================')
-                num_to_show -= 1
-            elif report:
-                unshown.append(report)
-        if line == '</ol>':
-            break
-    return unshown, num_to_show, found
+    paper = {}
+    # Collapse the whitespace arXiv puts inside <title>/<summary>.
+    paper['title'] = ' '.join(text('title').split())
+    paper['abstract'] = ' '.join(text('summary').split())
+    paper['date'] = format_date(text('published'))
+
+    authors = []
+    for author in entry.findall(ATOM_NS + 'author'):
+        name = author.find(ATOM_NS + 'name')
+        if name is not None and name.text:
+            authors.append(name.text.strip())
+    paper['authors'] = authors
+
+    # <id> is the canonical abstract page; force https.
+    paper['main_page'] = text('id').replace('http://', 'https://')
+    paper['pdf'] = ''
+    for link in entry.findall(ATOM_NS + 'link'):
+        if link.get('title') == 'pdf':
+            paper['pdf'] = link.get('href', '').replace('http://', 'https://')
+    return paper
+
+
+def build_query(keyword):
+    """
+    Build the arXiv API search_query.
+
+    If the keyword is plain English, restrict to the computer-science archive
+    to avoid ambiguous hits from other fields (e.g. 'transformer' in physics).
+    Unknown words (model/dataset jargon) are searched across all of arXiv.
+    """
+    keyword = keyword.lower()
+    words = keyword.split()
+    cs_only = keyword in set(['gan', 'bpc'])
+    if not cs_only:
+        spell = SpellChecker()
+        cs_only = not spell.unknown(words)
+
+    search = 'all:{}'.format(keyword)
+    if cs_only:
+        search += ' AND cat:cs.*'
+    return search
+
+
+def fetch_page(search_query, start):
+    params = urllib.parse.urlencode({
+        'search_query': search_query,
+        'start': start,
+        'max_results': PAGE_SIZE,
+        'sortBy': 'submittedDate',
+        'sortOrder': 'descending',
+    })
+    req = urllib.request.Request(API_URL + '?' + params)
+    response = urllib.request.urlopen(req)
+    return response.read()
 
 
 def get_papers(keyword, num_results=5):
-    """
-    If keyword is an English word, then search in CS category only to avoid papers from other categories, resulted from the ambiguity
-    """
+    keyword = keyword.lower()
+    search_query = build_query(keyword)
 
-    if keyword in set(['GAN', 'bpc']):
-        query_temp = 'https://arxiv.org/search/advanced?advanced=&terms-0-operator=AND&terms-0-term={}&terms-0-field=all&classification-computer_science=y&classification-physics_archives=all&date-filter_by=all_dates&date-year=&date-from_date=&date-to_date=&date-date_type=submitted_date&abstracts=show&size={}&order=-announced_date_first&start={}'
-        keyword = keyword.lower()
-    else:
-        keyword = keyword.lower()
-        words = keyword.split()
-        d = SpellChecker()
-        if not d.unknown(words):
-            query_temp = 'https://arxiv.org/search/advanced?advanced=&terms-0-operator=AND&terms-0-term={}&terms-0-field=all&classification-computer_science=y&classification-physics_archives=all&date-filter_by=all_dates&date-year=&date-from_date=&date-to_date=&date-date_type=submitted_date&abstracts=show&size={}&order=-announced_date_first&start={}'
-        else:
-            query_temp = 'https://arxiv.org/search/?searchtype=all&query={}&abstracts=show&size={}&order=-announced_date_first&start={}'
-    keyword_q = keyword.replace(' ', '+')
-    page = 0
-    per_page = 200
-    num_to_show = num_results
-    all_unshown = []
+    shown = 0
+    unshown = []          # papers that mention the keyword but report no numbers
+    any_results = False
 
-    while num_to_show > 0:
-        query = query_temp.format(keyword_q, str(per_page), str(per_page * page))
+    for page in range(MAX_PAGES):
+        if shown >= num_results:
+            break
 
-        req = urllib.request.Request(query)
         try:
-            response = urllib.request.urlopen(req)
+            raw = fetch_page(search_query, page * PAGE_SIZE)
         except urllib.error.HTTPError as e:
-            print('Error {}: problem accessing the server'.format(e.code))
+            print('Error {}: problem accessing the arXiv API'.format(e.code))
+            return
+        except urllib.error.URLError as e:
+            print('Error: could not reach the arXiv API ({})'.format(e.reason))
             return
 
-        txt = response.read()
-        unshown, num_to_show, found = txt2reports(txt, keyword, num_to_show)
-        if not found and not all_unshown and num_to_show == num_results:
-            print('Sorry, we were unable to find any abstract with the word {}'.format(keyword))
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            print('Error: could not parse the arXiv API response')
             return
 
-        if num_to_show < num_results / 2 or not found:
-            for report in all_unshown[:num_to_show]:
+        entries = root.findall(ATOM_NS + 'entry')
+        if not entries:
+            break  # no more papers to page through
+
+        for entry in entries:
+            if shown >= num_results:
+                break
+            any_results = True
+            paper = parse_entry(entry)
+            if not paper['authors']:
+                continue
+            report, paper_has_number = get_report(paper, keyword)
+            if paper_has_number:
                 print(report)
                 print('====================================================')
-            if not found:
-                return
-            num_to_show -= len(all_unshown)
+                shown += 1
+            elif report:
+                unshown.append(report)
+
+        if len(entries) < PAGE_SIZE:
+            break  # last page reached
+
+        if shown < num_results and page < MAX_PAGES - 1:
+            time.sleep(REQUEST_DELAY)  # be polite to arXiv
+
+    # Fall back to keyword-mentioning papers without numeric results.
+    if shown < num_results and unshown:
+        for report in unshown[:num_results - shown]:
+            print(report)
+            print('====================================================')
+            shown += 1
+
+    if shown == 0:
+        if any_results:
+            print('Sorry, we found papers but none with a usable abstract '
+                  'summary for the word {}'.format(keyword))
         else:
-            all_unshown.extend(unshown)
-        page += 1
+            print('Sorry, we were unable to find any abstract with the word '
+                  '{}'.format(keyword))
 
 
 def main():
@@ -319,7 +297,6 @@ def main():
     except ValueError:
         keyword = ' '.join(sys.argv[1:])
         num_results = 5
-
 
     get_papers(keyword, num_results)
 
