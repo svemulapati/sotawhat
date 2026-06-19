@@ -1,5 +1,7 @@
+import html
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -7,15 +9,23 @@ import warnings
 
 import nltk
 from nltk.tokenize import word_tokenize
-from six.moves.html_parser import HTMLParser
 from spellchecker import SpellChecker
+
+# On macOS the system Python often can't verify SSL certs out of the box,
+# breaking both nltk downloads and arxiv requests. Point the default HTTPS
+# context at certifi's bundle so the tool works without extra setup.
+try:
+    import certifi
+    ssl._create_default_https_context = (
+        lambda *a, **k: ssl.create_default_context(cafile=certifi.where())
+    )
+except ImportError:
+    pass
 
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
-
-h = HTMLParser()
 
 AUTHOR_TAG = '<a href="/search/?searchtype=author'
 TITLE_TAG = '<p class="title is-5 mathjax">'
@@ -50,10 +60,24 @@ def get_next_result(lines, start):
     """
 
     result = {}
-    idx = lines[start + 3][10:].find('"')
-    result['main_page'] = lines[start + 3][9:10 + idx]
-    idx = lines[start + 4][23:].find('"')
-    result['pdf'] = lines[start + 4][22: 23 + idx] + '.pdf'
+    # Find the abstract page link (.../abs/<id>) and pdf link (.../pdf/<id>)
+    # within the first few lines of this result block. arXiv's markup shifts
+    # over time, so match by URL pattern rather than fixed line offsets.
+    main_page = ''
+    pdf = ''
+    for line in lines[start:start + 8]:
+        if not main_page:
+            m = re.search(r'href="(https?://arxiv\.org/abs/[^"]+)"', line)
+            if m:
+                main_page = m.group(1)
+        if not pdf:
+            m = re.search(r'href="(https?://arxiv\.org/pdf/[^"]+)"', line)
+            if m:
+                pdf = m.group(1)
+        if main_page and pdf:
+            break
+    result['main_page'] = main_page
+    result['pdf'] = pdf if pdf.endswith('.pdf') else pdf + '.pdf'
 
     start += 4
 
@@ -183,9 +207,9 @@ def extract_line(abstract, keyword, limit):
 
 def get_report(paper, keyword):
     if keyword in paper['abstract'].lower():
-        title = h.unescape(paper['title'])
+        title = html.unescape(paper['title'])
         headline = '{} ({} - {})\n'.format(title, paper['authors'][0], paper['date'])
-        abstract = h.unescape(paper['abstract'])
+        abstract = html.unescape(paper['abstract'])
         extract, has_number = extract_line(abstract, keyword, 280 - len(headline))
         if extract:
             report = headline + extract + '\nLink: {}'.format(paper['main_page'])
@@ -195,7 +219,8 @@ def get_report(paper, keyword):
 
 def txt2reports(txt, keyword, num_to_show):
     found = False
-    txt = ''.join(chr(c) for c in txt)
+    if isinstance(txt, (bytes, bytearray)):
+        txt = txt.decode('utf-8', errors='replace')
     lines = txt.split('\n')
     lines = clean_empty_lines(lines)
     unshown = []
